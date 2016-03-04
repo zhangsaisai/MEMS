@@ -1,0 +1,259 @@
+/*
+ * calculate.c
+ *
+ *  Created on: Mar 24, 2015
+ *      Author: lab
+ */
+#include "calculate.h"
+#include <math.h>
+#include "mpu6050.h"
+#include "hmc5883.h"
+#include "function.h"
+#include "delay.h"
+#include "RealTimeLdd1.h"
+#include "FC321.h"
+#include <math.h>
+//#define halfT 0.5f  //half the sample period,halfT 0.5f需要根据具体姿态更新周期来调整，T是姿态更新周期，T*角速度=微分角度
+float exInt = 0, eyInt = 0, ezInt = 0;        // scaled integral error
+extern float q0, q1, q2, q3;
+extern float init_ax, init_ay, init_az, init_gx, init_gy, init_gz, init_mx, init_my, init_mz;
+extern float Mx_offset,My_offset,Mz_offset,Mx_gain,My_gain,Mz_gain;
+extern float Gx_offset,Gy_offset,Gz_offset;
+extern float pitch,roll,yaw;
+extern uint8 cnt;
+
+/*******************************************************************************
+快速计算 1/Sqrt(x)，源自雷神3的一段代码，神奇的0x5f3759df！比正常的代码快4倍 	
+*******************************************************************************/
+float invSqrt(float x) 
+{
+	float halfx = 0.5f * x;
+	float y = x;
+	int i = *(int*)&y;
+	i = 0x5f3759df - (i>>1);
+	y = *(float*)&i;
+	y = y * (1.5f - (halfx * y * y));
+	return y;
+}
+
+word get_NOWtime()
+{
+	word time_us;
+	word *time;
+	RealTimeLdd1_TDeviceData *DeviceDataPrv = PE_LDD_DeviceDataList[PE_LDD_COMPONENT_RealTimeLdd1_ID];
+	FC321_GetTimeUS(time);
+    DeviceDataPrv->TimerTicks = 0;         /* clear counter of timer ticks */
+	time_us = *time;
+	return time_us;
+}
+/*----------------------------------------------
+执行校准，获取磁传感器的最大值和最小值
+预处理：八字旋转法，进行归一化，各轴的测量值加上偏移乘以比例系数
+简单的校准过程是：
+1.在空间旋转磁传感器，找出各敏感轴最大值和最小值
+2.-(max+min)/2来计算各轴的偏移，相当于原点相对于椭球心的偏移
+3.令X轴的比例系数x_gain=1
+4.y_gain = x_gain * (y_max-y_min)/(x_max-x_min);
+5.z_gain = x_gain * (z_max-z_min)/(x_max-x_min);
+参考：http://www.amobbs.com/thread-5483833-1-11.html
+----------------------------------------------*/
+void Calibration_mag(void)
+{
+	short Mx,My,Mz;
+	short max_Mx,max_My,max_Mz,min_Mx,min_My,min_Mz;
+	uint8 i;
+	
+	max_Mx=max_My=max_Mz=min_Mx=min_My=min_Mz=0;
+    while( cnt < 100 )//计时100次，大概为10s
+    {
+       get_mag(&Mx,&My,&Mz);
+       if ( Mx>max_Mx) max_Mx = Mx;
+          else if ( Mx<min_Mx ) min_Mx = Mx;
+       if ( My>max_My ) max_My = My;
+          else if ( My<min_My ) min_My = My;
+       if ( Mz>max_Mz )max_Mz = Mz;
+          else if ( Mz<min_Mz )min_Mz = Mz;
+       //for(i=0;i<500;i++);
+    }
+    
+    Mx_offset = -(max_Mx + min_Mx)/2;
+    My_offset = -(max_My + min_My)/2;
+    Mz_offset = -(max_Mz + min_Mz)/2;
+    Mx_gain = 1; 
+    My_gain = Mx_gain * (max_My-min_My)/(max_Mx-min_Mx);
+    Mz_gain = Mx_gain * (max_Mz-min_Mz)/(max_Mx-min_Mx);  
+    
+    //use constant replace every calibrate
+    Mx_offset = -9;
+    My_offset = 200;
+    Mz_offset = -58;
+    Mx_gain = 1;
+    My_gain = 0.83763;
+    Mz_gain = 1.088;
+}
+
+
+
+/**********************************************************************
+*实现函数:		void MPU6050_InitGyro_Offset(void)
+获取陀螺仪的初始零偏常量：此时陀螺仪应该被静止，以测试静止时陀螺仪的输出；
+之后在开始正常测量后，应该在线监测陀螺仪的零偏，以保证偏移不会过大
+**********************************************************************/
+void Calibration_gyro(void)
+{
+	uint8 i;
+	short Gx,Gy,Gz;
+	int32	tempgx=0,tempgy=0,tempgz=0;
+	Gx_offset=0;
+	Gy_offset=0;												  
+	Gz_offset=0;
+
+ 	for(i=0;i<100;i++)
+	{
+ 		time_delay_us(200);
+		get_gyro(&Gx,&Gy,&Gz);
+		tempgx+= Gx;
+		tempgy+= Gy;
+		tempgz+= Gz;
+	}
+	Gx_offset=tempgx/100;
+	Gy_offset=tempgy/100;
+	Gz_offset=tempgz/100;
+}
+
+/*******************************************************************************
+* Function Name  : init_quaternion
+* Description    : 算出初始化四元数q0 q1 q2 q3.
+* Input          : None
+* Output         : None
+* Return         : None
+*******************************************************************************/
+void init_quaternion(void)
+{ 
+	  short  Ax,Ay,Az,Mx,My,Mz,Gx,Gy,Gz;
+	  short  max_Mx,max_My,max_Mz,min_Mx,min_My,min_Mz=0;
+	  float  init_yaw, init_pitch, init_roll;
+	  uint8  i;
+	  //for(i=0;i<10;i++)//静止时多循环几次，传感器数据稳定后再采集
+	  {  
+		  get_acc(&Ax,&Ay,&Az);
+		  get_gyro(&Gx,&Gy,&Gz);
+		  get_mag(&Mx,&My,&Mz);
+		  
+		  init_ax=(float)(Ax / Accel_2_Scale_Factor);	   //单位转化成重力加速度的单位：m/s2
+		  init_ay=(float)(Ay / Accel_2_Scale_Factor);
+		  init_az=(float)(Az / Accel_2_Scale_Factor);
+
+		  //x y z轴进行校准，参考MEMSense的校准方法 
+		  init_mx =(float)( Mx + Mx_offset ) * Mx_gain;						
+		  init_my =(float)( My + My_offset ) * My_gain;
+		  init_mz =(float)( Mz + Mz_offset ) * Mz_gain;
+	  }   
+	  //常用定义：此处的轴向定义是绕x轴旋转是Roll，绕y轴旋转是Pitch，绕z轴旋转是Yaw，旋转顺序（Z-Y-X）和LSM303DLH（Z-Y-X）文档中的旋转顺序相同（X，Y的顺序）
+	  init_pitch = -asin(init_ax); 
+	  //以下为论坛资料里的参考代码
+	  //init_roll  =  atan2(init_ay, init_az);
+	  //以下为LSM303DLH的参考代码
+	  init_roll  =  asin( init_ay / cos(init_pitch) );
+	  //此处yaw的计算为LSM303DLH的参考代码，符合先旋转Y后旋转X的矩阵形式
+	  init_yaw   = atan2(init_my*cos(init_roll) + init_mx*sin(init_roll)*sin(init_pitch) - init_mz*sin(init_roll)*cos(init_pitch),
+	  					  init_mx*cos(init_pitch) + init_mz*sin(init_pitch));                       //atan2(my, mx);
+	  //此处yaw的计算为论坛资料里的参考代码，符合先旋转X后旋转Y的矩阵形式	  
+	  //init_yaw   = -atan2(init_mx*cos(init_roll) + init_my*sin(init_roll)*sin(init_pitch) + init_mz*sin(init_roll)*cos(init_pitch),
+	  //				  init_my*cos(init_pitch) - init_mz*sin(init_pitch));                       //atan2(my, mx);
+	  //此处欧拉角到四元数矩阵的转换可参考pdf《全角度欧拉角与四元数转换研究》，该矩阵形式与LSM303DLH一致
+	  //不同的旋转顺序对应不同的欧拉角矩阵，对应不同的四元数矩阵，四元数矩阵可以参考《全角度欧拉角与四元数转换研究》
+	  //根据Z\Y\X的旋转顺序，求出四元数的表达式
+	  q0 = cos(0.5*init_roll)*cos(0.5*init_pitch)*cos(0.5*init_yaw) + sin(0.5*init_roll)*sin(0.5*init_pitch)*sin(0.5*init_yaw);  //w
+	  q1 = sin(0.5*init_roll)*cos(0.5*init_pitch)*cos(0.5*init_yaw) - cos(0.5*init_roll)*sin(0.5*init_pitch)*sin(0.5*init_yaw);  //x   绕x轴旋转是roll
+	  q2 = cos(0.5*init_roll)*sin(0.5*init_pitch)*cos(0.5*init_yaw) + sin(0.5*init_roll)*cos(0.5*init_pitch)*sin(0.5*init_yaw);  //y   绕y轴旋转是pitch
+	  q3 = cos(0.5*init_roll)*cos(0.5*init_pitch)*sin(0.5*init_yaw) - sin(0.5*init_roll)*sin(0.5*init_pitch)*cos(0.5*init_yaw);  //z   绕z轴旋转是yaw  
+	  yaw = init_yaw * 57.3;
+}
+
+/*******************************************************************************
+* Function Name  : IMUupdate
+* Description    : accel gyro mag的融合算法，源自S.O.H. Madgwick.
+* Input          : None
+* Output         : None
+* Return         : None
+
+// q0 q1 q2 q3需要初始化才能带入到下面的程序中，不能直接使用1 0 0 0进行下面的计算，整个步骤为：
+// 1.首先校准accle gyro mag；
+// 2.调用init_quaternion，根据1中accle的xyz轴数据，并利用公式计算出初始化欧拉角，
+//   其中ACCEL_1G=9.81，单位都是m/s2，而init_yaw可以用磁力计计算出来；
+// 3.根据自己的采样周期，来调整halfT，halfT=采样周期/2，采样周期为执行1次AHRSupdate所用的时间；
+// 4.将2中计算出的欧拉角转化为初始化的四元数q0 q1 q2 q3，融合加速度计，陀螺仪，算出更新后的欧拉角pitch和roll，然后使用pitch roll和磁力计的数据进行互补滤波融合得到yaw，即可使用，但是欧拉角有奇点；
+// 5.或直接使用四元数；
+// 6.重复4，即可更新姿态;
+
+//核心是陀螺仪，加速度计用来修正补偿pitch和roll，磁力计用来修正补偿yaw;
+//gx, gy, gz单位为弧度/s，ax, ay, az为加速度计输出的原始16进制数据, mx, my, mz为磁力计输出的原始16进制数据；
+//前进方向：mpu9150的加速度计和陀螺仪的x轴为前进方向;
+//以下程序采用的参考方向为：mpu9150的加速度计和陀螺仪所指的xyz方向为正方向；
+
+//在量程为正负500度/s的前提下，陀螺仪的灵敏度是65.5LSB/度/s，所以把陀螺仪输出的十六进制数据除以65.5就是角速度，单位是°/s，
+//然后除以57.3就变成弧度制;(1弧度=180/pi=57.3度)
+//欧拉角单位为弧度radian，乘以57.3以后转换为角度
+*******************************************************************************/
+void IMUupdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz) 
+{
+        float norm, halfT;
+        float vx, vy, vz;
+        float ex, ey, ez;
+		word time_us; 
+		/*归一化测量值，加速度计和磁力计的单位是什么都无所谓，因为它们在此被作了归一化处理*/        
+        //normalise the measurements
+        norm = invSqrt(ax*ax + ay*ay + az*az); 
+		//norm = sqrtf(ax*ax + ay*ay + az*az);//库函数 
+        ax = ax / norm;
+        ay = ay / norm;
+        az = az / norm;
+        //以下为计算重力在体坐标系下的三个分量，因为重力归一化为1，旋转矩阵的第三列乘以单位重力向量1等于旋转矩阵的第三列
+        vx = 2*(q1*q3 - q0*q2);
+        vy = 2*(q0*q1 + q2*q3);
+        vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
+        //现在把加速度的测量矢量和参考矢量做叉积，把磁场的测量矢量和参考矢量也做叉积。都拿来来修正陀螺。
+        //axyz和vxyz都位于机体坐标系上的，因此叉积向量也位于机体坐标系上，而陀螺积分误差也是在机体坐标系，而且叉积的大小与陀螺积分误差成正比，因此用来纠正陀螺
+        // error is sum of cross product between reference direction of fields and direction measured by sensors
+        ex = (ay*vz - az*vy);
+        ey = (az*vx - ax*vz);
+        ez = (ax*vy - ay*vx);
+        // integral error scaled integral gain
+        exInt = exInt + ex*Ki;
+        eyInt = eyInt + ey*Ki;
+        ezInt = ezInt + ez*Ki;
+        // adjusted gyroscope measurements
+        gx = gx + Kp*ex + exInt;
+        gy = gy + Kp*ey + eyInt;
+        gz = gz + Kp*ez + ezInt;
+        //time_us = get_NOWtime();//单位为us
+        halfT = (float)20.0/2000.0;//20ms,单位s,除以2得出采样周期的一半
+        halfT = (float)33.3333333333/2000.0;//30hz,单位s,除以2得出采样周期的一半
+        // integrate quaternion rate and normalise，四元数更新算法，一阶毕卡求解法
+        q0 = q0 + (-q1*gx - q2*gy - q3*gz)*halfT;//参考秦永元惯性导航9.2.4节公式（9.2.51）和公式（9.2.53）
+        q1 = q1 + (q0*gx + q2*gz - q3*gy)*halfT;
+        q2 = q2 + (q0*gy - q1*gz + q3*gx)*halfT;
+        q3 = q3 + (q0*gz + q1*gy - q2*gx)*halfT;  
+        // normalise quaternion
+        norm = invSqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+        //norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+        q0 = q0 / norm;       //w
+        q1 = q1 / norm;       //x
+        q2 = q2 / norm;       //y
+        q3 = q3 / norm;       //z
+        //旋转顺序是（Z-Y-X），三个单位旋转矩阵相乘以后（参考《全角度欧拉角与四元数转换研究》）和四元数矩阵对应，可以求出姿态角
+		/*由四元数计算出pitch  roll  yaw
+		roll=arctan2(2wx+2yz, 1-2xx-2yy);pitch=arcsin(2wy-2zx);
+		yaw=arctan2(2wz+2xy, 1-2yy-2zz);乘以57.3是为了将弧度转化为角度
+		yaw   = atan2(2 * q1 * q2 + 2 * q0 * q3, -2 * q2 * q2 - 2 * q3 * q3 + 1) * 57.3; */
+		pitch = asin(-2 * q1 * q3 + 2 * q0 * q2); //俯仰角，绕y轴转动	 
+		roll  = atan2(2 * q2 * q3 + 2 * q0 * q1, -2 * q1 * q1 - 2 * q2* q2 + 1); //滚动角，绕x轴转动
+		//0.9和0.1是修正系数，该公式是将磁力计的长期准确度和陀螺仪的高灵敏度进行互补滤波，即对陀螺仪的数据进行高通滤波，对磁力计的数据进行低通滤波，再相加
+		yaw   = 0.9 * (yaw - init_gz*2*halfT) //陀螺仪在Z轴方向的转动角速度乘以周期，得到在Z轴方向变化的角度
+				+ 5.73 * atan2(my*cos(roll) + mx*sin(roll)*sin(pitch) - mz*sin(roll)*cos(pitch),
+				  mx*cos(pitch) + mz*sin(pitch)); 
+		pitch = pitch * 57.3;
+		roll = roll * 57.3;
+
+}

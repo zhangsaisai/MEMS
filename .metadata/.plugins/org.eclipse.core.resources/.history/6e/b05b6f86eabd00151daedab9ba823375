@@ -1,0 +1,171 @@
+/* ###################################################################
+**     Filename    : ProcessorExpert.c
+**     Project     : ProcessorExpert
+**     Processor   : MKL25Z128VFM4
+**     Version     : Driver 01.01
+**     Compiler    : GNU C Compiler
+**     Date/Time   : 2015-01-14, 10:27, # CodeGen: 0
+**     Abstract    :
+**         Main module.
+**         This module contains user's application code.
+**     Settings    :
+**     Contents    :
+**         No public methods
+**
+** ###################################################################*/
+/*!
+** @file ProcessorExpert.c
+** @version 01.01
+** @brief
+**         Main module.
+**         This module contains user's application code.
+*/         
+/*!
+**  @addtogroup ProcessorExpert_module ProcessorExpert module documentation
+**  @{
+*/         
+/* MODULE ProcessorExpert */
+
+
+/* Including needed modules to compile this module/procedure */
+#include "Cpu.h"
+#include "Events.h"
+#include "SysTick.h"
+#include "SCL_G.h"
+#include "SDA_G.h"
+#include "SCL_M.h"
+#include "SDA_M.h"
+#include "MPU6050_DRDY.h"
+#include "SS_SPI0.h"
+#include "Led.h"
+#include "TI1.h"
+#include "TimerIntLdd1.h"
+#include "TU1.h"
+#include "FC321.h"
+#include "RealTimeLdd1.h"
+#include "TU2.h"
+/* Including shared modules, which are used for whole project */
+#include "PE_Types.h"
+#include "PE_Error.h"
+#include "PE_Const.h"
+#include "IO_Map.h"
+
+/* User includes (#include below this line is not maintained by Processor Expert) */
+#include "delay.h"
+#include "function.h"
+#include "hmc5883.h"
+#include "mpu6050.h"
+#include "Aliases.h"
+#include "Globals.h"
+
+
+uint16 TimingDelay;//systick
+float q0, q1, q2, q3;//global Q
+float init_ax, init_ay, init_az, init_gx, init_gy, init_gz, init_mx, init_my, init_mz;//calibration sensor data
+float Mx_offset,My_offset,Mz_offset;// offset gain of mag
+float Mx_gain=1;//calibration gain of mag
+float My_gain=1;
+float Mz_gain=1;
+float Gx_offset,Gy_offset,Gz_offset;//offset of gyro
+float pitch,roll,yaw;//angle of IMU
+uint8 cnt;//表示定时器进入了多少次中断，判断是否10s计时完成，每次计时为100ms
+
+//variables of testing communication 
+uint8       MCU_NUMBER = 1; 
+uint8       Init_State = 100;//MCU Init State is 0
+
+
+volatile bool SlaveReceivedFlg = FALSE;
+volatile bool MasterReceivedFlg = FALSE;
+
+char master_send[96]    = {0};//command the master send to slave
+char slave_send[96]     = {
+		0x81,0x85,0x85,0x82,0x7F,0x80,0x84,0x87,0x87,0x88,
+		0x89,0x89,0x89,0x87,0x86,0x85,0x84,0x83,0x83,0x82,
+		0x7E,0x78,0x76,0x7D,0x86,0x89,0x88,0x85,0x85,0x85,
+		0x86,0x87,0x87,0x87,0x85,0x82,0x7E,0x7C,0x7D,0x81,
+		0x82,0x80,0x7D,0x7B,0x7B,0x7C,0x7D,0x7E,0x7D,0x7B,
+		0x7B,0x7B,0x7A,0x7B,0x7D,0x80,0x81,0x80,0x81,0x82,
+		0x83,0x83,0x83,0x82,0x82,0x82,0x81,0x7D,0x7A,0x7B,
+		0x7E,0x81,0x80,0x7E,0x7D,0x7C,0x7D,0x7D,0x7E,0x80,
+		0x7F,0x7F,0x7F,0x7E,0x7D,0x7F,0x82,0x82,0x81,0x80,
+		0x7F,0x80,0x81,0x81,0x80,0x80};//reply the slave send to master 
+char master_receive[96] = {0};//replt the master received
+char slave_receive[96]  = {0};//command the slave received
+
+
+/*lint -save  -e970 Disable MISRA rule (6.3) checking. */
+int main(void)
+/*lint -restore Enable MISRA rule (6.3) checking. */
+{
+  /* Write your local variable definition here */
+  short Ax,Ay,Az,Mx,My,Mz,Gx,Gy,Gz;
+  uint32 i;
+  /*** Processor Expert internal initialization. DON'T REMOVE THIS CODE!!! ***/
+  PE_low_level_init();
+  /*** End of Processor Expert internal initialization.                    ***/
+  
+  /* Write your code here */
+  UserInit();
+  
+  Init_State = 200;//afetr MEMS init complete,Init_State = 200 
+  
+  //ARM Init:tARMPtr->armStatus.foreBufferStatus == eNull,need to swap buffer to set the buffer empty
+  SwapARMDataBuffer();
+  
+  /* Slave first waits for receiving some message from master*/
+  SPI0Receive(slave_receive, COMM_SIZE);
+  
+  while(1){	   
+	  
+	  /* 以下是SPI传输传感器原始数据*/
+	  //SPI0Receive(slave_receive, COMM_SIZE);
+	  //ReadData();
+	  //Process();
+	  
+	  /*以下是计算传感器角度的部分*/
+	  Calibration_mag();
+	  init_quaternion();
+	  get_acc(&Ax,&Ay,&Az);
+	  get_gyro(&Gx,&Gy,&Gz);
+	  get_mag(&Mx,&My,&Mz);
+	  //将传感器原始数据转化为物理意义上的数据
+	  init_gx=(float)( Gx / (Gyro_500_Scale_Factor * 57.3));	  	     
+      init_gy=(float)( Gy / (Gyro_500_Scale_Factor * 57.3));
+      init_gz=(float)( Gz / (Gyro_500_Scale_Factor * 57.3));
+	  init_ax=(float)( Ax / Accel_2_Scale_Factor);
+	  init_ay=(float)( Ay / Accel_2_Scale_Factor);
+	  init_az=(float)( Az / Accel_2_Scale_Factor);
+	  init_mx =(float)( Mx + Mx_offset ) * Mx_gain;						
+	  init_my =(float)( My + My_offset ) * My_gain;
+	  init_mz =(float)( Mz + Mz_offset ) * Mz_gain;
+	  
+      IMUupdate(init_gx, init_gy, init_gz, init_ax, init_ay, init_az, init_mx, init_my, init_mz);
+	  
+  }
+  
+  /* For example: for(;;) { } */
+
+  /*** Don't write any code pass this line, or it will be deleted during code generation. ***/
+  /*** RTOS startup code. Macro PEX_RTOS_START is defined by the RTOS component. DON'T MODIFY THIS CODE!!! ***/
+  #ifdef PEX_RTOS_START
+    PEX_RTOS_START();                  /* Startup of the selected RTOS. Macro is defined by the RTOS component. */
+  #endif
+  /*** End of RTOS startup code.  ***/
+  /*** Processor Expert end of main routine. DON'T MODIFY THIS CODE!!! ***/
+  for(;;){}
+  /*** Processor Expert end of main routine. DON'T WRITE CODE BELOW!!! ***/
+} /*** End of main routine. DO NOT MODIFY THIS TEXT!!! ***/
+
+/* END ProcessorExpert */
+/*!
+** @}
+*/
+/*
+** ###################################################################
+**
+**     This file was created by Processor Expert 10.3 [05.08]
+**     for the Freescale Kinetis series of microcontrollers.
+**
+** ###################################################################
+*/
